@@ -10,6 +10,8 @@ import { EventEmitter } from 'events';
 import * as net from 'net';
 import { Client as SSHClient, ConnectConfig, SFTPWrapper } from 'ssh2';
 import { SSHExecCommandResponse, SSHExecOptions } from 'node-ssh';
+import { DockerCommandParser, ParsedCommand } from './docker-parser.js';
+import { ContainerContextManager, ContainerSession, ContainerInfo } from './container-context.js';
 
 // 连接配置
 export interface SSHConnectionConfig {
@@ -155,6 +157,7 @@ export class SSHService {
   private connectionCollection: Collection<any> | null = null;
   private credentialCollection: Collection<any> | null = null;
   private dataPath: string;
+  private containerContextManager: ContainerContextManager;
   private serviceReady: boolean = false;
   private serviceReadyPromise: Promise<void>;
   private isDocker: boolean = false;
@@ -182,15 +185,18 @@ export class SSHService {
   constructor() {
     this.dataPath = process.env.SSH_DATA_PATH || path.join(os.homedir(), '.mcp-ssh');
     this.isDocker = process.env.IS_DOCKER === 'true';
-    
+
+    // 初始化容器上下文管理器
+    this.containerContextManager = new ContainerContextManager();
+
     // 创建数据目录（如果不存在）
     if (!fs.existsSync(this.dataPath)) {
       fs.mkdirSync(this.dataPath, { recursive: true });
     }
-    
+
     // 初始化数据库
     this.serviceReadyPromise = this.initDatabase();
-    
+
     // 设置定期清理任务
     this.setupCleanupTasks();
   }
@@ -535,23 +541,47 @@ export class SSHService {
     if (!connection || !connection.client || connection.status !== ConnectionStatus.CONNECTED) {
       throw new Error(`连接 ${connectionId} 不可用或未连接`);
     }
-    
+
     try {
+      // 解析Docker命令
+      const parsedCommand = DockerCommandParser.parseCommand(command);
+
+      // 如果是需要容器上下文的复合命令，进行特殊处理
+      if (parsedCommand.needsContainerContext) {
+        return await this.executeDockerContextCommand(connectionId, parsedCommand, options);
+      }
+
+      // 检查是否有活跃的容器上下文
+      const activeContainer = this.containerContextManager.getActiveContainer(connectionId);
+      if (activeContainer && parsedCommand.type === 'regular') {
+        // 如果有活跃容器且是普通命令，将命令包装到容器内执行
+        const containerSession = this.containerContextManager.getContainerContext(connectionId, activeContainer);
+        const containerCommand = this.containerContextManager.buildContainerExecCommand(
+          activeContainer,
+          command,
+          containerSession || undefined,
+          false // 非交互式
+        );
+
+        // 递归调用执行容器命令（避免无限递归，因为docker exec命令不会再次进入这个分支）
+        return await this.executeCommand(connectionId, containerCommand, options);
+      }
+
       // 准备选项
       const execOptions: any = {};
-      
+
       // 工作目录
       if (options?.cwd) {
         execOptions.cwd = options.cwd;
       } else if (connection.currentDirectory) {
         execOptions.cwd = connection.currentDirectory;
       }
-      
+
       // 超时
       if (options?.timeout) {
-        execOptions.execOptions = { timeout: options.timeout };
+        execOptions.timeout = options.timeout;
       } else if (process.env.COMMAND_TIMEOUT && parseInt(process.env.COMMAND_TIMEOUT) > 0) {
-        execOptions.execOptions = { timeout: parseInt(process.env.COMMAND_TIMEOUT) };
+        execOptions.timeout = parseInt(process.env.COMMAND_TIMEOUT);
       }
 
       // 检查是否是sudo命令
@@ -572,15 +602,26 @@ export class SSHService {
           command = `echo "${password}" | ${sudoCommand} 2>/dev/null`;
         }
       }
-      
+
       // 执行命令
       const result = await connection.client.execCommand(command, execOptions);
-      
+
       // 更新当前目录（如果是cd命令）
       if (command.trim().startsWith('cd ')) {
         connection.currentDirectory = await this.getCurrentDirectory(connectionId);
       }
-      
+
+      // 如果是docker exec命令，更新容器上下文
+      if (parsedCommand.type === 'docker_exec' && parsedCommand.dockerCommands.length > 0) {
+        const dockerCmd = parsedCommand.dockerCommands[0];
+        this.containerContextManager.setContainerContext(connectionId, dockerCmd.containerName, {
+          workingDirectory: dockerCmd.workdir,
+          environment: dockerCmd.env,
+          user: dockerCmd.user
+        });
+        this.containerContextManager.updateActivity(connectionId, dockerCmd.containerName);
+      }
+
       return {
         stdout: result.stdout,
         stderr: result.stderr,
@@ -589,7 +630,7 @@ export class SSHService {
     } catch (error) {
       // 处理错误
       console.error(`在连接 ${connectionId} 上执行命令时出错:`, error);
-      
+
       return {
         stdout: '',
         stderr: error instanceof Error ? error.message : String(error),
@@ -597,7 +638,104 @@ export class SSHService {
       };
     }
   }
-  
+
+  // 执行需要Docker容器上下文的复合命令
+  private async executeDockerContextCommand(
+    connectionId: string,
+    parsedCommand: ParsedCommand,
+    options?: { cwd?: string, timeout?: number }
+  ): Promise<CommandResult> {
+    const connection = this.connections.get(connectionId);
+    if (!connection || !connection.client) {
+      throw new Error(`连接 ${connectionId} 不可用`);
+    }
+
+    let combinedOutput = '';
+    let combinedError = '';
+    let lastExitCode = 0;
+    let activeContainer: string | null = null;
+
+    try {
+      // 首先执行所有Docker exec命令
+      for (const dockerCmd of parsedCommand.dockerCommands) {
+        const dockerExecCommand = DockerCommandParser.buildContainerCommand(
+          { ...parsedCommand, dockerCommands: [dockerCmd] }
+        )[0];
+
+        const dockerExecOptions: any = {
+          cwd: options?.cwd || connection.currentDirectory
+        };
+        if (options?.timeout) {
+          dockerExecOptions.timeout = options.timeout;
+        }
+
+        const result = await connection.client.execCommand(dockerExecCommand, dockerExecOptions);
+
+        if (result.stdout) combinedOutput += result.stdout + '\n';
+        if (result.stderr) combinedError += result.stderr + '\n';
+        lastExitCode = result.code || 0;
+
+        // 更新容器上下文
+        activeContainer = dockerCmd.containerName;
+        this.containerContextManager.setContainerContext(connectionId, dockerCmd.containerName, {
+          workingDirectory: dockerCmd.workdir,
+          environment: dockerCmd.env,
+          user: dockerCmd.user
+        });
+        this.containerContextManager.updateActivity(connectionId, dockerCmd.containerName);
+
+        // 如果Docker命令失败，停止执行
+        if (lastExitCode !== 0) {
+          break;
+        }
+      }
+
+      // 如果有常规命令且有活跃容器，在容器内执行这些命令
+      if (parsedCommand.regularCommands.length > 0 && activeContainer && lastExitCode === 0) {
+        const containerSession = this.containerContextManager.getContainerContext(connectionId, activeContainer);
+        const combinedRegularCommand = parsedCommand.regularCommands.join(' && ');
+
+        // 构建在容器内执行的命令（非交互式）
+        const containerExecCommand = this.containerContextManager.buildContainerExecCommand(
+          activeContainer,
+          `sh -c "${combinedRegularCommand}"`,
+          containerSession || undefined,
+          false // 非交互式
+        );
+
+        const containerExecOptions: any = {
+          cwd: options?.cwd || connection.currentDirectory
+        };
+        if (options?.timeout) {
+          containerExecOptions.timeout = options.timeout;
+        }
+
+        const result = await connection.client.execCommand(containerExecCommand, containerExecOptions);
+
+        if (result.stdout) combinedOutput += result.stdout;
+        if (result.stderr) combinedError += result.stderr;
+        lastExitCode = result.code || 0;
+
+        // 更新容器活动时间
+        this.containerContextManager.updateActivity(connectionId, activeContainer);
+      }
+
+      return {
+        stdout: combinedOutput.trim(),
+        stderr: combinedError.trim(),
+        code: lastExitCode
+      };
+
+    } catch (error) {
+      console.error(`执行Docker上下文命令时出错:`, error);
+      return {
+        stdout: combinedOutput.trim(),
+        stderr: (combinedError + (error instanceof Error ? error.message : String(error))).trim(),
+        code: 1
+      };
+    }
+  }
+
   // 在后台执行命令
   public async executeBackgroundCommand(connectionId: string, command: string, options?: { cwd?: string, interval?: number }): Promise<string> {
     const connection = this.connections.get(connectionId);
@@ -1777,4 +1915,135 @@ export class SSHService {
       this.db.saveDatabase();
     }
   }
-} 
+
+  // Docker相关方法
+
+  // 获取容器列表
+  public async getContainerList(connectionId: string, refresh: boolean = false): Promise<ContainerInfo[]> {
+    if (!refresh) {
+      const cached = this.containerContextManager.getCachedContainerList(connectionId);
+      if (cached) {
+        return cached;
+      }
+    }
+
+    const connection = this.connections.get(connectionId);
+    if (!connection || !connection.client || connection.status !== ConnectionStatus.CONNECTED) {
+      throw new Error(`连接 ${connectionId} 不可用或未连接`);
+    }
+
+    try {
+      const result = await connection.client.execCommand(
+        'docker ps -a --format "table {{.Names}}\\t{{.ID}}\\t{{.Image}}\\t{{.Status}}\\t{{.Ports}}\\t{{.CreatedAt}}"',
+        { timeout: 10000 } as any
+      );
+
+      if (result.code !== 0) {
+        throw new Error(`获取容器列表失败: ${result.stderr}`);
+      }
+
+      const containers: ContainerInfo[] = [];
+      const lines = result.stdout.split('\n').slice(1); // 跳过表头
+
+      for (const line of lines) {
+        if (line.trim()) {
+          const parts = line.split('\t');
+          if (parts.length >= 6) {
+            containers.push({
+              name: parts[0],
+              id: parts[1],
+              image: parts[2],
+              status: parts[3],
+              ports: parts[4] ? parts[4].split(',').map(p => p.trim()) : [],
+              created: new Date(parts[5])
+            });
+          }
+        }
+      }
+
+      // 缓存结果
+      this.containerContextManager.cacheContainerList(connectionId, containers);
+      return containers;
+
+    } catch (error) {
+      console.error(`获取容器列表时出错:`, error);
+      throw error;
+    }
+  }
+
+  // 进入容器
+  public async enterContainer(
+    connectionId: string,
+    containerName: string,
+    options?: {
+      shell?: string;
+      workdir?: string;
+      user?: string;
+    }
+  ): Promise<string> {
+    const connection = this.connections.get(connectionId);
+    if (!connection || !connection.client || connection.status !== ConnectionStatus.CONNECTED) {
+      throw new Error(`连接 ${connectionId} 不可用或未连接`);
+    }
+
+    // 检查容器是否存在（强制刷新缓存）
+    const containers = await this.getContainerList(connectionId, true);
+    const container = containers.find(c =>
+      c.name === containerName ||
+      c.id.startsWith(containerName) ||
+      c.name.includes(containerName)
+    );
+
+    if (!container) {
+      // 尝试直接检查容器是否存在
+      try {
+        const checkResult = await connection.client.execCommand(`docker ps -a --filter name=${containerName} --format "{{.Names}}"`, { timeout: 5000 } as any);
+        if (!checkResult.stdout.trim()) {
+          throw new Error(`容器 ${containerName} 不存在`);
+        }
+      } catch (error) {
+        throw new Error(`容器 ${containerName} 不存在或无法访问`);
+      }
+    } else if (!container.status.includes('Up')) {
+      throw new Error(`容器 ${containerName} 未运行`);
+    }
+
+    // 设置容器上下文
+    this.containerContextManager.setContainerContext(connectionId, containerName, {
+      workingDirectory: options?.workdir || '/root',
+      user: options?.user
+    });
+
+    return `已进入容器 ${containerName}，后续命令将在此容器内执行`;
+  }
+
+  // 退出容器上下文
+  public exitContainer(connectionId: string, containerName?: string): string {
+    if (containerName) {
+      this.containerContextManager.closeContainerSession(connectionId, containerName);
+      return `已退出容器 ${containerName}`;
+    } else {
+      this.containerContextManager.closeAllContainerSessions(connectionId);
+      return '已退出所有容器上下文';
+    }
+  }
+
+  // 获取当前容器上下文
+  public getCurrentContainerContext(connectionId: string): ContainerSession | null {
+    return this.containerContextManager.getContainerContext(connectionId);
+  }
+
+  // 获取所有活跃的容器会话
+  public getActiveContainerSessions(connectionId: string): ContainerSession[] {
+    return this.containerContextManager.getActiveContainerSessions(connectionId);
+  }
+
+  // 获取容器上下文管理器统计信息
+  public getContainerStats(): {
+    activeSessions: number;
+    totalSessions: number;
+    cachedConnections: number;
+  } {
+    return this.containerContextManager.getStats();
+  }
+}

@@ -26,11 +26,13 @@
   "license": "ISC",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.6.1",
-    "@types/node": "^20.0.0",
+    "@types/node": "^20.19.17",
+    "@types/shell-quote": "^1.7.5",
     "dotenv": "^16.0.3",
     "keytar": "^7.9.0",
     "lokijs": "^1.5.12",
     "node-ssh": "^13.1.0",
+    "shell-quote": "^1.8.3",
     "ssh2": "^1.14.0",
     "typescript": "^5.0.0",
     "zod": "^3.22.4"

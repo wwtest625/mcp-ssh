@@ -2,6 +2,7 @@ node_modules/
 dist/
 .env
 *.log
+.mcp-ssh.lock
 .DS_Store
 .vscode/
 .idea/

@@ -1,11 +1,11 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { SSHService, SSHConnectionConfig, ConnectionStatus, TerminalSession, FileTransferInfo, BatchTransferConfig, TunnelConfig, CommandResult } from './ssh-service.js';
+import { SSHService, SSHConnectionConfig, ConnectionStatus, FileTransferInfo, CommandResult } from './ssh-service.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { createHash } from 'crypto';
+import { quote } from 'shell-quote';
 
 export class SshMCP {
   private server: McpServer;
@@ -13,24 +13,49 @@ export class SshMCP {
   private activeConnections: Map<string, Date> = new Map();
   private backgroundExecutions: Map<string, { interval: NodeJS.Timeout, lastCheck: Date }> = new Map();
 
+  private debugLog(message: string) {
+    const timestamp = new Date().toISOString();
+    console.error(`[SSH-MCP DEBUG ${timestamp}] ${message}`);
+  }
+
   constructor() {
-    // 初始化SSH服务
-    this.sshService = new SSHService();
+    this.debugLog('SshMCP构造函数开始');
 
-    // 初始化MCP服务器
-    this.server = new McpServer({
-      name: "ssh-mcp",
-      version: "1.0.0"
-    });
+    try {
+      // 初始化SSH服务
+      this.debugLog('初始化SSH服务...');
+      this.sshService = new SSHService();
+      this.debugLog('SSH服务初始化完成');
 
-    // 注册工具
-    this.registerTools();
+      // 初始化MCP服务器
+      this.debugLog('初始化MCP服务器...');
+      this.server = new McpServer({
+        name: "ssh-mcp",
+        version: "1.0.0"
+      });
+      this.debugLog('MCP服务器初始化完成');
 
-    // 连接到标准输入/输出
-    const transport = new StdioServerTransport();
-    this.server.connect(transport).catch(err => {
-      console.error('连接MCP传输错误:', err);
-    });
+      // 注册工具
+      this.debugLog('注册工具...');
+      this.registerTools();
+      this.debugLog('工具注册完成');
+
+      // 连接到标准输入/输出
+      this.debugLog('创建标准输入/输出传输...');
+      const transport = new StdioServerTransport();
+      this.debugLog('连接MCP传输...');
+      this.server.connect(transport).catch(err => {
+        this.debugLog(`连接MCP传输错误: ${err.message}`);
+        console.error('连接MCP传输错误:', err);
+      });
+      this.debugLog('MCP传输连接已启动');
+
+    } catch (error) {
+      this.debugLog(`SshMCP构造函数出错: ${error}`);
+      throw error;
+    }
+
+    this.debugLog('SshMCP构造函数完成');
   }
 
   /**
@@ -39,16 +64,19 @@ export class SshMCP {
   private registerTools(): void {
     // 连接管理
     this.registerConnectionTools();
-    
+
     // 命令执行
     this.registerCommandTools();
-    
+
+    // Docker命令执行
+    this.registerDockerExecuteTools();
+
     // 文件传输
     this.registerFileTools();
-    
+
     // 会话管理
     this.registerSessionTools();
-    
+
     // 终端交互
     this.registerTerminalTools();
 
@@ -1116,60 +1144,7 @@ export class SshMCP {
       }
     );
     
-    // 获取当前目录工具
-    this.server.tool(
-      "getCurrentDirectory",
-      "Gets the current working directory of an SSH connection.",
-      {
-        connectionId: z.string()
-      },
-      async ({ connectionId }) => {
-        try {
-          const connection = this.sshService.getConnection(connectionId);
-          
-          if (!connection) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 连接 ${connectionId} 不存在`
-              }],
-              isError: true
-            };
-          }
-          
-          if (connection.status !== ConnectionStatus.CONNECTED) {
-            return {
-              content: [{
-                type: "text",
-                text: `错误: 连接 ${connection.name || connectionId} 未连接`
-              }],
-              isError: true
-            };
-          }
-          
-          // 更新活跃时间
-          this.activeConnections.set(connectionId, new Date());
-          
-          // 获取当前目录
-          const result = await this.sshService.executeCommand(connectionId, 'pwd');
-          
-          return {
-            content: [{
-              type: "text",
-              text: result.stdout.trim()
-            }]
-          };
-        } catch (error) {
-          return {
-            content: [{
-              type: "text",
-              text: `获取当前目录时出错: ${error instanceof Error ? error.message : String(error)}`
-            }],
-            isError: true
-          };
-        }
-      }
-    );
+
   }
   
   /**
@@ -2319,5 +2294,181 @@ export class SshMCP {
     
     // 组合输出
     return prefix + omittedMessage + suffix;
+  }
+
+
+
+
+
+  /**
+   * 注册Docker命令执行工具
+   */
+  private registerDockerExecuteTools(): void {
+    // 在Docker容器内执行命令
+    this.server.tool(
+      "executeCommandInDocker",
+      "Executes a command inside a Docker container.",
+      {
+        connectionId: z.string().describe("SSH connection ID"),
+        containerName: z.string().describe("Name or ID of the Docker container"),
+        command: z.string().describe("Command to execute inside the container"),
+        workdir: z.string().optional().describe("Working directory inside the container"),
+        user: z.string().optional().describe("User to run the command as"),
+        interactive: z.boolean().optional().default(false).describe("Whether to run in interactive mode"),
+        timeout: z.number().optional().describe("Command timeout in milliseconds")
+      },
+      async (args) => {
+        try {
+          const { connectionId, containerName, command, workdir, user, interactive = false, timeout } = args;
+
+          // 构建docker exec命令
+          let dockerCommand = 'docker exec';
+
+          // 添加选项
+          if (interactive) {
+            dockerCommand += ' -it';
+          }
+
+          if (workdir) {
+            dockerCommand += ` -w ${workdir}`;
+          }
+
+          if (user) {
+            dockerCommand += ` -u ${user}`;
+          }
+
+          // 使用 bash -l 来加载完整的登录环境，确保 PATH 等环境变量正确加载
+          const escapedCommand = command.replace(/'/g, `'\\''`);
+          dockerCommand += ` ${containerName} bash -l -c '${escapedCommand}'`;
+
+
+
+          // 执行命令
+          const result = await this.sshService.executeCommand(connectionId, dockerCommand, { timeout });
+
+          return {
+            content: [{
+              type: "text",
+              text: `在容器 ${containerName} 内执行命令: ${command}\n\n${result.stdout}${result.stderr ? `\n错误输出:\n${result.stderr}` : ''}${result.code !== 0 ? `\n命令退出码: ${result.code}` : ''}\n\n[root@${this.sshService.getConnection(connectionId)?.config.host || 'unknown'} ${this.sshService.getConnection(connectionId)?.currentDirectory || '/'}]$ `
+            }]
+          };
+        } catch (error) {
+          return {
+            content: [{
+              type: "text",
+              text: `在容器内执行命令时出错: ${error instanceof Error ? error.message : String(error)}`
+            }],
+            isError: true
+          };
+        }
+      }
+    );
+
+    // 诊断容器环境
+    this.server.tool(
+      "diagnoseContainerEnvironment",
+      "Diagnoses the environment inside a Docker container to help troubleshoot command execution issues.",
+      {
+        connectionId: z.string().describe("SSH connection ID"),
+        containerName: z.string().describe("Name or ID of the Docker container"),
+        packageName: z.string().optional().describe("Specific package/command to check for")
+      },
+      async (args) => {
+        try {
+          const { connectionId, containerName, packageName } = args;
+
+          let diagnostics = `=== 容器 ${containerName} 环境诊断 ===\n\n`;
+
+          // 基本信息
+          const basicCommands = [
+            { name: '操作系统', cmd: 'cat /etc/os-release | head -5' },
+            { name: 'Shell', cmd: 'echo $SHELL' },
+            { name: '当前用户', cmd: 'whoami' },
+            { name: '当前目录', cmd: 'pwd' },
+            { name: 'PATH环境变量', cmd: 'echo $PATH' }
+          ];
+
+          for (const { name, cmd } of basicCommands) {
+            try {
+              const result = await this.sshService.executeCommand(
+                connectionId,
+                `docker exec ${containerName} ${cmd}`,
+                { timeout: 5000 }
+              );
+              diagnostics += `${name}:\n${result.stdout || result.stderr}\n\n`;
+            } catch (error) {
+              diagnostics += `${name}: 检查失败 - ${error}\n\n`;
+            }
+          }
+
+          // Python 环境检查
+          diagnostics += `=== Python 环境 ===\n`;
+          const pythonCommands = [
+            { name: 'Python版本', cmd: 'python --version' },
+            { name: 'Python3版本', cmd: 'python3 --version' },
+            { name: 'pip版本', cmd: 'pip --version' },
+            { name: 'pip3版本', cmd: 'pip3 --version' }
+          ];
+
+          for (const { name, cmd } of pythonCommands) {
+            try {
+              const result = await this.sshService.executeCommand(
+                connectionId,
+                `docker exec ${containerName} ${cmd}`,
+                { timeout: 5000 }
+              );
+              diagnostics += `${name}: ${result.stdout || result.stderr}\n`;
+            } catch (error) {
+              diagnostics += `${name}: 不可用\n`;
+            }
+          }
+
+          // 特定包检查
+          if (packageName) {
+            diagnostics += `\n=== ${packageName} 包检查 ===\n`;
+
+            const packageCommands = [
+              { name: `which ${packageName}`, cmd: `which ${packageName}` },
+              { name: `${packageName} --version`, cmd: `${packageName} --version` },
+              { name: `${packageName} --help`, cmd: `${packageName} --help | head -10` },
+              { name: `pip show ${packageName}`, cmd: `pip show ${packageName}` },
+              { name: `python -c "import ${packageName}"`, cmd: `python -c "import ${packageName}; print('${packageName} 可导入')"` }
+            ];
+
+            for (const { name, cmd } of packageCommands) {
+              try {
+                const result = await this.sshService.executeCommand(
+                  connectionId,
+                  `docker exec ${containerName} ${cmd}`,
+                  { timeout: 10000 }
+                );
+                if (result.code === 0) {
+                  diagnostics += `✅ ${name}: ${result.stdout}\n`;
+                } else {
+                  diagnostics += `❌ ${name}: ${result.stderr || '命令失败'}\n`;
+                }
+              } catch (error) {
+                diagnostics += `❌ ${name}: 执行失败\n`;
+              }
+            }
+          }
+
+          return {
+            content: [{
+              type: "text",
+              text: diagnostics
+            }]
+          };
+        } catch (error) {
+          return {
+            content: [{
+              type: "text",
+              text: `诊断容器环境时出错: ${error instanceof Error ? error.message : String(error)}`
+            }],
+            isError: true
+          };
+        }
+      }
+    );
   }
 }
